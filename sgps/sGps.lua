@@ -531,28 +531,139 @@ function sgps.locate(opts)
   assert(#hostIds >= minFixes,
     "sgps.locate: fewer trusted hosts (" .. #hostIds .. ") than minFixes (" .. minFixes .. ")")
 
+  -- Answers accumulate across retries, keyed by host. Resetting them each
+  -- attempt (as this used to) meant a link where different hosts drop out on
+  -- different attempts never reached quorum, even with every host reachable:
+  -- three answers now plus three answers a moment later still counted as
+  -- three. Hosts that already answered aren't re-pinged, so retries get
+  -- cheaper as the set fills up.
+  --
+  -- The cost is that a point can be up to a couple of retries old, so on a
+  -- fast-moving ship the distances blend slightly different moments. Pass
+  -- opts.accumulate = false to demand all answers within one attempt instead.
+  local accumulate = opts.accumulate ~= false
+  local answers = {}
+
+  local function answerCount()
+    local n = 0
+    for _ in pairs(answers) do n = n + 1 end
+    return n
+  end
+
   for attempt = 1, retries do
-    local points = {}
-    local thunks = {}
+    if not accumulate then answers = {} end
+
+    local pending = {}
     for _, id in ipairs(hostIds) do
-      thunks[#thunks + 1] = function()
-        local hostPublicKey = state.trustedHosts[id]
-        if hostPublicKey then
-          local point = pingHost(id, hostPublicKey, timeout)
-          if point then points[#points + 1] = point end
+      if not answers[id] then pending[#pending + 1] = id end
+    end
+
+    if #pending > 0 then
+      local thunks = {}
+      for _, id in ipairs(pending) do
+        thunks[#thunks + 1] = function()
+          local hostPublicKey = state.trustedHosts[id]
+          if hostPublicKey then
+            local point = pingHost(id, hostPublicKey, timeout)
+            if point then answers[id] = point end
+          end
         end
       end
+      parallel.waitForAll(table.unpack(thunks))
     end
-    parallel.waitForAll(table.unpack(thunks))
 
-    if #points >= minFixes then
+    if answerCount() >= minFixes then
+      local points = {}
+      for _, point in pairs(answers) do points[#points + 1] = point end
       local x, y, z, err = sgps.solveWithOutlierRejection(points, minFixes)
       if x then return x, y, z, nil end
     end
 
     if attempt < retries then sleep(0.5 * attempt) end
   end
-  return nil, nil, nil, "insufficient_fixes"
+
+  -- Say how close it got: "2 of 5 answered" points at radio range or dead
+  -- hosts, while "5 of 5 answered" points at bad host geometry instead.
+  return nil, nil, nil, string.format("insufficient_fixes (%d of %d hosts answered, need %d)",
+    answerCount(), #hostIds, minFixes)
+end
+
+-- ===========================================================================
+-- Diagnostics
+-- ===========================================================================
+
+-- Pings every trusted host individually and reports what each one did, so a
+-- failing fix can be attributed rather than guessed at. Returns a list of
+-- {hostId, ok, distance, latency, x, y, z, err} sorted by host ID.
+function sgps.diagnose(opts)
+  opts = opts or {}
+  local timeout = opts.timeout or sgps.DEFAULT_TIMEOUT
+  local hostIds = opts.hostIds or sgps.listTrustedHosts()
+
+  local results = {}
+  local thunks = {}
+  for _, id in ipairs(hostIds) do
+    thunks[#thunks + 1] = function()
+      local hostPublicKey = state.trustedHosts[id]
+      if not hostPublicKey then
+        results[#results + 1] = {hostId = id, ok = false, err = "no pinned key"}
+        return
+      end
+      local started = os.clock()
+      local point, err = pingHost(id, hostPublicKey, timeout)
+      local latency = os.clock() - started
+      if point then
+        results[#results + 1] = {hostId = id, ok = true, distance = point.d,
+          latency = latency, x = point.x, y = point.y, z = point.z}
+      else
+        results[#results + 1] = {hostId = id, ok = false, latency = latency,
+          err = err or "no reply"}
+      end
+    end
+  end
+
+  if #thunks > 0 then parallel.waitForAll(table.unpack(thunks)) end
+  table.sort(results, function(a, b) return a.hostId < b.hostId end)
+  return results
+end
+
+-- Checks whether the hosts that answered are too flat to solve from. Four
+-- hosts at the same altitude pin down X and Z but leave Y almost free, so the
+-- solver either fails or returns a confident, wrong height. Returns ok, reason.
+function sgps.checkGeometry(results)
+  local ys, xs, zs = {}, {}, {}
+  for _, r in ipairs(results) do
+    if r.ok then
+      ys[#ys + 1] = r.y
+      xs[#xs + 1] = r.x
+      zs[#zs + 1] = r.z
+    end
+  end
+  if #ys < 4 then return false, "fewer than 4 hosts answered" end
+
+  local function spread(values)
+    local lo, hi = values[1], values[1]
+    for _, v in ipairs(values) do
+      if v < lo then lo = v end
+      if v > hi then hi = v end
+    end
+    return hi - lo
+  end
+
+  local ySpread = spread(ys)
+  local horizontalSpread = math.max(spread(xs), spread(zs))
+  if ySpread < 1 then
+    return false, string.format(
+      "all answering hosts are at the same altitude (Y spread %.1f) - altitude " ..
+      "cannot be solved; move one host well above or below the others", ySpread)
+  end
+  if horizontalSpread > 0 and ySpread < horizontalSpread * 0.1 then
+    return false, string.format(
+      "hosts are nearly coplanar (Y spread %.1f vs %.1f horizontal) - altitude " ..
+      "will be imprecise; raise or lower one host", ySpread, horizontalSpread)
+  end
+  return true, string.format("Y spread %.1f, horizontal spread %.1f",
+    ySpread, horizontalSpread)
 end
 
 -- ===========================================================================
