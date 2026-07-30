@@ -71,7 +71,8 @@ local LIBRARIES = {"enc.lua", "sip.lua", "sgps/sGps.lua", "nav/sNav.lua"}
 local ROLES = {
   host  = {script = "gpshost.lua", label = "sGps position host"},
   heli  = {script = "heli.lua",    label = "helicopter autopilot"},
-  pilot = {script = "pilot.lua",   label = "operator console"}
+  pilot = {script = "pilot.lua",   label = "operator console"},
+  watch = {script = "watch.lua",   label = "position watcher"}
 }
 
 local args = {...}
@@ -211,12 +212,14 @@ local function chooseRole()
   print("  1) sGps position host")
   print("  2) helicopter autopilot")
   print("  3) operator console")
+  print("  4) position watcher (prints coordinates as they change)")
   while true do
-    write("Choice (1-3): ")
+    write("Choice (1-4): ")
     local answer = (read() or ""):lower()
     if answer == "1" or answer == "host" then return "host" end
     if answer == "2" or answer == "heli" then return "heli" end
     if answer == "3" or answer == "pilot" then return "pilot" end
+    if answer == "4" or answer == "watch" then return "watch" end
   end
 end
 
@@ -267,6 +270,24 @@ local function configureHeli()
   local operatorIds = askNumberList("  operators: ")
   writeConfig("/heli_config.tbl", {gpsHostIds = hostIds, operatorIds = operatorIds})
   print("Saved " .. #hostIds .. " hosts, " .. #operatorIds .. " operators.")
+  if #hostIds < 4 then
+    print("NOTE: fewer than 4 hosts - sGps needs 4 for a fix by default.")
+  end
+end
+
+local function configureWatch()
+  -- Nothing to ask if this computer already has hosts pinned, or a ship config
+  -- to borrow the list from.
+  if fs.exists("/trusted_hosts.tbl") or fs.exists("/heli_config.tbl") then
+    print("")
+    print("Reusing the GPS hosts already known to this computer.")
+    return
+  end
+  print("")
+  print("Computer IDs of your sGps hosts, separated by spaces:")
+  local hostIds = askNumberList("  hosts: ")
+  writeConfig("/watch_config.tbl", {gpsHostIds = hostIds})
+  print("Saved " .. #hostIds .. " hosts.")
   if #hostIds < 4 then
     print("NOTE: fewer than 4 hosts - sGps needs 4 for a fix by default.")
   end
@@ -330,6 +351,7 @@ end
 
 if role == "host" then configureHost()
 elseif role == "heli" then configureHeli()
+elseif role == "watch" then configureWatch()
 else configurePilot() end
 
 -- Boot straight into the role rather than leaving it to be run by hand.
