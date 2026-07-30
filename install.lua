@@ -68,6 +68,9 @@ local PASTEBIN = {
 
 local LIBRARIES = {"enc.lua", "sip.lua", "sgps/sGps.lua", "nav/sNav.lua"}
 
+-- Handy on any machine, regardless of role, and small.
+local EXTRAS = {"watch.lua", "gpsdiag.lua"}
+
 local ROLES = {
   host  = {script = "gpshost.lua", label = "sGps position host"},
   heli  = {script = "heli.lua",    label = "helicopter autopilot"},
@@ -343,6 +346,11 @@ for _, path in ipairs(LIBRARIES) do wanted[#wanted + 1] = path end
 wanted[#wanted + 1] = roleScript
 -- The helicopter is the only role that needs the navigation layer, but the
 -- others are small and having them present makes a computer easy to repurpose.
+-- The watcher and the diagnostic go everywhere: the moment you need them is
+-- the moment the radio is misbehaving and downloading is awkward.
+for _, path in ipairs(EXTRAS) do
+  if path ~= roleScript then wanted[#wanted + 1] = path end
+end
 
 for _, path in ipairs(wanted) do
   local ok, info = fetch(path, "/" .. path)
