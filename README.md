@@ -24,7 +24,11 @@ Non-interactive:
 install host 128 72 -340     GPS host at those coordinates
 install heli                 the helicopter
 install pilot                an operator console
+install watch                prints coordinates as they change
 ```
+
+`watch` is the quickest way to confirm the constellation works — it prints the
+position whenever it moves and stays quiet when it doesn't.
 
 ## Layers
 
@@ -35,8 +39,8 @@ install pilot                an operator console
 | `sgps/sGps.lua` | GPS that only trusts pinned hosts, requires a quorum, and rejects outliers |
 | `nav/sNav.lua` | Autopilot: GPS-derived inertial estimator, learned flight model, remote control |
 
-Entry points: `gpshost.lua`, `heli.lua`, `pilot.lua`. Helpers: `install.lua`,
-`publish.lua`, `diskstartup.lua`.
+Entry points: `gpshost.lua`, `heli.lua`, `pilot.lua`, `watch.lua`. Helpers:
+`install.lua`, `publish.lua`, `diskstartup.lua`.
 
 ## Self-tests
 
