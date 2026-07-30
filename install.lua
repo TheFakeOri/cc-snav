@@ -162,7 +162,11 @@ local function fetch(relativePath, destination)
   end
 
   if BASE_URL then
-    local body, err = httpFetch(BASE_URL .. relativePath)
+    -- raw.githubusercontent.com caches for several minutes, so a fresh push can
+    -- otherwise install the previous version without any sign of it. The query
+    -- string is ignored by the server but defeats the CDN cache.
+    local body, err = httpFetch(BASE_URL .. relativePath ..
+      "?cb=" .. tostring(os.epoch("utc")))
     if body then
       local ok, why = looksLikeLua(body, relativePath)
       if ok then
