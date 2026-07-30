@@ -592,9 +592,56 @@ end
 -- Diagnostics
 -- ===========================================================================
 
--- Pings every trusted host individually and reports what each one did, so a
--- failing fix can be attributed rather than guessed at. Returns a list of
--- {hostId, ok, distance, latency, x, y, z, err} sorted by host ID.
+-- What radio are we actually using? A wired modem reports nil distance on every
+-- message, and sGps discards replies without a distance - so a computer that
+-- picked up a wired modem gets zero fixes while looking perfectly connected.
+function sgps.modemInfo()
+  if not state.modemSide then return nil end
+  local ok, wireless = pcall(peripheral.call, state.modemSide, "isWireless")
+  return {
+    side = state.modemSide,
+    wireless = (ok and wireless) and true or false,
+    known = ok
+  }
+end
+
+-- Plaintext reachability test: the IDENTIFY exchange, which involves no
+-- encryption and no pinned key. Separating this from a full position ping is
+-- the whole point - if probe succeeds but the ping doesn't, the radio is fine
+-- and the problem is the keys; if probe itself fails, nothing else matters.
+-- Returns a table: {ok, distance, distanceMissing, key, latency, err}
+function sgps.probe(hostId, timeout)
+  timeout = timeout or sgps.DEFAULT_TIMEOUT
+  local started = os.clock()
+  transmit(hostId, buildIdentifyRequest())
+
+  local deadline = started + timeout
+  while true do
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then
+      return {ok = false, err = "no reply", latency = os.clock() - started}
+    end
+    local senderId, payload, distance = rawReceive(remaining)
+    if senderId == hostId and type(payload) == "string" then
+      local key = parseIdentifyResponse(payload)
+      if key then
+        return {
+          ok = true,
+          key = key,
+          distance = type(distance) == "number" and distance or nil,
+          distanceMissing = type(distance) ~= "number",
+          latency = os.clock() - started
+        }
+      end
+    end
+  end
+end
+
+-- Tests every host two ways: a plaintext probe (is it there at all?) and a full
+-- encrypted position ping (do the keys work?). Reporting both separates causes
+-- that look identical from the outside. Returns a list, sorted by host ID, of
+--   {hostId, reachable, probeDistance, distanceMissing, keyPinned, keyChanged,
+--    ok, distance, latency, x, y, z, err}
 function sgps.diagnose(opts)
   opts = opts or {}
   local timeout = opts.timeout or sgps.DEFAULT_TIMEOUT
@@ -604,21 +651,43 @@ function sgps.diagnose(opts)
   local thunks = {}
   for _, id in ipairs(hostIds) do
     thunks[#thunks + 1] = function()
-      local hostPublicKey = state.trustedHosts[id]
-      if not hostPublicKey then
-        results[#results + 1] = {hostId = id, ok = false, err = "no pinned key"}
-        return
+      local entry = {hostId = id}
+
+      local probe = sgps.probe(id, timeout)
+      entry.reachable = probe.ok
+      entry.probeDistance = probe.distance
+      entry.distanceMissing = probe.ok and probe.distanceMissing or false
+
+      local pinned = state.trustedHosts[id]
+      entry.keyPinned = pinned ~= nil
+
+      -- A host that regenerated its keypair still answers a probe, but nothing
+      -- it says can be decrypted with the key we pinned. Catch that explicitly
+      -- rather than reporting it as a mysterious timeout.
+      if probe.ok and pinned and probe.key then
+        entry.keyChanged = (probe.key.n ~= pinned.n) or (probe.key.e ~= pinned.e)
       end
-      local started = os.clock()
-      local point, err = pingHost(id, hostPublicKey, timeout)
-      local latency = os.clock() - started
-      if point then
-        results[#results + 1] = {hostId = id, ok = true, distance = point.d,
-          latency = latency, x = point.x, y = point.y, z = point.z}
+
+      if not probe.ok then
+        entry.ok = false
+        entry.err = "unreachable"
+      elseif not pinned then
+        entry.ok = false
+        entry.err = "no pinned key"
       else
-        results[#results + 1] = {hostId = id, ok = false, latency = latency,
-          err = err or "no reply"}
+        local started = os.clock()
+        local point, err = pingHost(id, pinned, timeout)
+        entry.latency = os.clock() - started
+        if point then
+          entry.ok = true
+          entry.distance, entry.x, entry.y, entry.z = point.d, point.x, point.y, point.z
+        else
+          entry.ok = false
+          entry.err = err or "no reply to position request"
+        end
       end
+
+      results[#results + 1] = entry
     end
   end
 
