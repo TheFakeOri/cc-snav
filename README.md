@@ -28,7 +28,27 @@ install watch                prints coordinates as they change
 ```
 
 `watch` is the quickest way to confirm the constellation works — it prints the
-position whenever it moves and stays quiet when it doesn't.
+position whenever it moves and stays quiet when it doesn't. Every install also
+gets `watch.lua` and `gpsdiag.lua`, since you want them present *before* the
+radio starts misbehaving.
+
+## When fixes fail
+
+```
+gpsdiag
+```
+
+Pings each host individually over several rounds and tells you which answered,
+how far away they are, how long they took, and whether the hosts are arranged
+well enough to solve from. It distinguishes the two real causes:
+
+- **Not enough hosts answering** — radio range or a host that isn't running.
+  Wireless modem range in CC:Tweaked depends on altitude, so low hosts reach far
+  less than high ones and marginal links come and go — which is what makes fixes
+  work only *sometimes*. `gpsdiag` flags hosts as `always` / `INTERMITTENT` /
+  `NEVER` so you can tell which.
+- **All hosts answering but fixes still failing** — geometry. Hosts all at the
+  same altitude can't pin down height. Move one well above or below the rest.
 
 ## Layers
 
