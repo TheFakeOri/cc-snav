@@ -62,6 +62,27 @@ well enough to solve from. It distinguishes the two real causes:
 Entry points: `gpshost.lua`, `heli.lua`, `pilot.lua`, `watch.lua`. Helpers:
 `install.lua`, `publish.lua`, `diskstartup.lua`.
 
+## Upgrading an existing constellation
+
+**Update the computers in any order.** The sGps request/response protocol is
+versioned (`sgps.PROTOCOL_VERSION`, currently 2). A v2 client asks for a
+symmetric reply; a host that predates that ignores the request field and
+answers the old RSA way, and a v2 client accepts either shape. So a half-updated
+constellation keeps working — it just doesn't get the speedup until both ends of
+a given pair are updated. `gpsdiag` is the quickest way to see what you have.
+
+Two behaviour changes worth knowing before you reboot everything:
+
+- **A wired modem is now a loud failure, not a silent one.** sGps needs the
+  block distance that only a wireless `modem_message` reports, so a computer
+  that picked up a wired modem got zero fixes while looking perfectly
+  connected. Autodetection now prefers wireless and refuses a wired-only
+  computer with an explanation. Set `sgps.ALLOW_WIRED_MODEM` if you really want
+  the old behaviour.
+- **Outlier rejection needs six hosts** to identify a liar, where it previously
+  claimed to manage with five. It did not actually manage it — see the setup
+  notes below.
+
 ## Self-tests
 
 ```
@@ -71,7 +92,9 @@ sGps.lua test
 sNav.lua test
 ```
 
-`sNav.lua wiring` prints the redstone wiring reference.
+106 assertions across the four, none of which need a modem, GPS host or ship.
+`enc.lua bench` times the crypto primitives; `sNav.lua wiring` prints the
+redstone wiring reference.
 
 ## Setting it up
 
@@ -80,6 +103,13 @@ sNav.lua test
    give the solver nothing vertical to work with. Install each as `host` with
    its exact F3 coordinates, and note the computer ID and key fingerprint it
    prints.
+
+   Four is the minimum to *get* a fix. **Six is the minimum for a lying or
+   compromised host to be identifiable.** Four points determine a position
+   exactly, so with five hosts, dropping the suspect one leaves four that fit
+   any claims perfectly and the data cannot say who lied — sGps refuses
+   (`inconsistent_hosts`) rather than return a confident wrong answer. With six
+   it identifies and drops the liar. Wireless modems are cheap; run six.
 2. **The ship.** Install as `heli`, giving it those host IDs and the operator's
    ID. Wire the controls (`sNav.lua wiring`). Centre a stepped tail by hand
    before first boot.
@@ -102,14 +132,53 @@ implementation with RC4 and a non-cryptographic checksum, on a platform with no
 secure random source. It will stop casual spoofing, snooping and replay between
 players. It will not stop someone determined. Details are in each file's header.
 
+A position response is encrypted symmetrically, under a fresh 16-byte key the
+client sends inside its RSA-encrypted request, and carries an 8-byte keyed tag.
+The tag is a keyed checksum, not a real MAC — there is no hash function in this
+project. The echoed nonce proves the reply is fresh and that its writer knew
+that key; the tag is what covers RC4's malleability. Neither proves the
+position *claim* is true, which is what the quorum and outlier rejection are
+for.
+
 Two practical notes:
 
 - **Change the passphrases after installing.** The `passphrase` fields ship as
   `"change-this-passphrase"`. They live in plaintext next to the keys they
   protect (unavoidable for unattended boot), so they stop someone reading a key
   out with `edit`, nothing more.
-- **Fix latency dominates flight.** Expect a position fix every one to a few
-  seconds; the estimator dead-reckons between them. Fly with margin.
+- **The estimator still dead-reckons between fixes**, so fly with margin. Fix
+  latency used to dominate everything; it no longer does — see Performance.
+
+## Performance
+
+The RSA underneath every message used to set the pace for the whole stack, and
+a position fix cost several RSA operations. Three changes in `enc.lua` removed
+most of that: Montgomery reduction instead of divide-and-remainder in the
+modular-multiply inner loop, Knuth long division where a real division is still
+needed, and Chinese-remainder private keys (two exponentiations modulo the
+half-size primes rather than one modulo `n`). `sGps.lua` then stopped needing an
+RSA private-key operation per host per fix at all.
+
+Measured under CraftOS-PC on 256-bit keys, before and after:
+
+| | before | after |
+|---|---|---|
+| Key generation | 2495 ms | 21 ms |
+| Encrypt (public key) | 11.4 ms | 0.5 ms |
+| Decrypt (private key) | 264 ms | 2.1 ms |
+| Client crypto per 4-host fix | ~1100 ms | ~2.2 ms |
+
+Treat those as relative, not absolute: CraftOS-PC runs native Lua, while in
+Minecraft this is Cobalt on the JVM sharing one thread with every other
+computer, so real figures are slower. The point is the ratio — crypto is no
+longer what limits the fix rate. Radio round trips and Minecraft's 20 ticks a
+second are, which makes `nav.FIX_INTERVAL` of one second comfortable.
+
+`enc.lua bench` prints the numbers on your own machine.
+
+Old keys still work. Private keys gained CRT parameters, but `d` is still
+stored and used when they're absent, so a keypair generated by an earlier
+version decrypts unchanged.
 
 ## Requirements
 

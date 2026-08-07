@@ -111,6 +111,17 @@
       YAW_DIRECTION_SETTLE on a reversal), and nav.setCommand blocks for
       them. Budget roughly half a second per step.
 
+  STOPPING THE PROGRAM STOPS THE SHIP. The controls are redstone outputs, so
+  they keep driving the machinery after the Lua that set them is gone - a
+  Ctrl+T at full throttle would otherwise send the ship off with nobody
+  steering. Every blocking entry point (nav.serveRemote, nav.calibrate,
+  nav.flyTo) therefore runs through nav.withSafeShutdown, which catches the
+  terminate, calls nav.allStop() - recentring a stepped tail on the way - and
+  then re-raises, so Ctrl+T still ends the program. Wrap your own blocking
+  loops the same way if they hold the controls:
+
+    nav.withSafeShutdown(function() ... end)
+
   HONEST LIMITS:
     - Inherits every crypto caveat from enc.lua/sip.lua (toy RSA, RC4,
       weak randomness, non-cryptographic checksum) and every positioning
@@ -123,6 +134,9 @@
       straight line and then in a turn. Run it somewhere open, high, and
       far from anything you mind hitting. It skips whatever phases the
       ship isn't equipped for, so a minimal ship calibrates faster.
+    - nav.acquire's optional nudge is the one place that deliberately leaves
+      throttle on when it returns (calibration wants the ship already moving).
+      Call it from inside nav.withSafeShutdown, or stop the ship yourself.
     - A ship that loses GPS quorum (jamming, out of range, hosts down)
       gets no fixes. The estimator keeps dead-reckoning and marks the
       state stale; the autopilot refuses to keep flying blind past
@@ -402,6 +416,10 @@ end
 -- Control layer: analog redstone out to Create Redstone Links.
 -- ===========================================================================
 
+-- Memoised nav.capabilities() result. Only the control map decides it, so it is
+-- rebuilt lazily and dropped by setControlMap rather than recomputed per tick.
+local capabilityCache = nil
+
 function nav.setControlMap(map)
   assert(type(map) == "table" and map.forward,
     "nav.setControlMap: a `forward` control is mandatory - a ship with no way " ..
@@ -421,15 +439,22 @@ function nav.setControlMap(map)
   state.controlMap = map
   state.activeColors = {}
   state.yawDeflection = 0
+  capabilityCache = nil -- the wiring changed, so what the ship can do changed
 end
 
 -- What this ship can actually be told to do, derived from which controls are
 -- wired. Everything downstream - command clamping, guidance, calibration -
 -- reads this rather than assuming a fully-equipped ship.
+--
+-- The result is CACHED and shared, because nav.setCommand asks for it on every
+-- guidance tick and the answer only changes when the wiring does. Treat it as
+-- read-only; nav.setControlMap invalidates it. (Callers that want to reason
+-- about a hypothetical ship pass their own table as opts.capabilities instead.)
 function nav.capabilities()
+  if capabilityCache then return capabilityCache end
   local m = state.controlMap or {}
   local stepped = m.yawStep ~= nil
-  return {
+  capabilityCache = {
     forward  = m.forward ~= nil,
     reverse  = m.reverse ~= nil,
     yawMode  = stepped and "stepped" or "level",
@@ -441,6 +466,7 @@ function nav.capabilities()
     descend  = m.down ~= nil,
     vertical = (m.up ~= nil) or (m.down ~= nil)
   }
+  return capabilityCache
 end
 
 local function clamp(v, lo, hi)
@@ -468,7 +494,7 @@ local function axisOutputs(value, positiveName, negativeName)
 end
 
 local function emit(controlName, level)
-  local ctrl = state.controlMap[controlName]
+  local ctrl = state.controlMap and state.controlMap[controlName]
   if not ctrl then return end
   if ctrl.color then
     local active = state.activeColors[ctrl.side] or {}
@@ -479,6 +505,30 @@ local function emit(controlName, level)
     redstone.setBundledOutput(ctrl.side, mask)
   else
     redstone.setAnalogOutput(ctrl.side, level)
+  end
+end
+
+-- The same splitting policy as axisOutputs, driven straight out to the two
+-- controls instead of through a throwaway table. nav.setCommand runs this three
+-- times per guidance tick, and with the fast enc.lua the guidance loop turns
+-- over often enough that a table (plus its `pairs` iteration) per axis per tick
+-- is real garbage for no benefit.
+--
+-- The idle side is zeroed BEFORE the active side is raised, so a thrust
+-- reversal can never momentarily drive both directions at once - the old
+-- `pairs` loop emitted in whatever order the hash landed in, so half the time
+-- it raised the new direction first.
+local function emitAxis(value, positiveName, negativeName)
+  local level = levelFor(value < 0 and -value or value)
+  if value > 0 then
+    emit(negativeName, 0)
+    emit(positiveName, level)
+  elseif value < 0 then
+    emit(positiveName, 0)
+    emit(negativeName, level)
+  else
+    emit(positiveName, 0)
+    emit(negativeName, 0)
   end
 end
 
@@ -569,33 +619,45 @@ function nav.setCommand(throttle, yaw, lift)
   local caps = nav.capabilities()
   throttle, yaw, lift = clampToCapabilities(throttle, yaw, lift, caps)
 
-  for name, level in pairs(axisOutputs(throttle, "forward", "reverse")) do emit(name, level) end
-  for name, level in pairs(axisOutputs(lift, "up", "down")) do emit(name, level) end
+  emitAxis(throttle, "forward", "reverse")
+  emitAxis(lift, "up", "down")
 
   if caps.yawMode == "stepped" then
-    local target = targetDeflectionFor(yaw, state.yawDeflection, nav.YAW_MAX_STEPS,
+    -- Guard the divisor: YAW_MAX_STEPS is an operator tunable, and a zero there
+    -- would turn the reported yaw into a NaN that poisons the learning pass and
+    -- every telemetry reply after it.
+    local maxSteps = nav.YAW_MAX_STEPS
+    if not (maxSteps and maxSteps >= 1) then maxSteps = 1 end
+    local target = targetDeflectionFor(yaw, state.yawDeflection, maxSteps,
       nav.YAW_HYSTERESIS)
     if target ~= state.yawDeflection then
       pulseYawStep(target > state.yawDeflection and 1 or -1)
     end
     -- The effective yaw command is where the tail actually sits, not what was
     -- asked for, so telemetry and the learning pass see the real deflection.
-    yaw = state.yawDeflection / nav.YAW_MAX_STEPS
+    yaw = state.yawDeflection / maxSteps
   else
-    for name, level in pairs(axisOutputs(yaw, "yawRight", "yawLeft")) do emit(name, level) end
+    emitAxis(yaw, "yawRight", "yawLeft")
   end
 
-  local changed = throttle ~= state.command.throttle or yaw ~= state.command.yaw or
-    lift ~= state.command.lift
-  state.command.throttle, state.command.yaw, state.command.lift = throttle, yaw, lift
+  local command = state.command
+  local changed = throttle ~= command.throttle or yaw ~= command.yaw or
+    lift ~= command.lift
+  command.throttle, command.yaw, command.lift = throttle, yaw, lift
   if changed then state.commandHeldSince = os.clock() end
 end
+
+local THRUST_CONTROLS = {"forward", "reverse", "up", "down"}
 
 function nav.allStop()
   local map = state.controlMap or {}
   -- Stop pushing first, then deal with the tail, so a ship that is about to
-  -- lose its steering at least isn't accelerating while it does.
-  for _, name in ipairs({"forward", "reverse", "up", "down"}) do
+  -- lose its steering at least isn't accelerating while it does. This ordering
+  -- also matters on the terminate path: if a second Ctrl+T lands inside the
+  -- stepped-tail recentre below (it sleeps, so it can be interrupted), thrust is
+  -- already at zero by then.
+  for i = 1, #THRUST_CONTROLS do
+    local name = THRUST_CONTROLS[i]
     if map[name] then emit(name, 0) end
   end
   -- A stepped tail holds its last angle mechanically. Dropping the lines here
@@ -608,8 +670,52 @@ function nav.allStop()
     if map.yawLeft then emit("yawLeft", 0) end
     if map.yawRight then emit("yawRight", 0) end
   end
-  state.command = {throttle = 0, yaw = 0, lift = 0}
+  local command = state.command
+  command.throttle, command.yaw, command.lift = 0, 0, 0
   state.commandHeldSince = os.clock()
+end
+
+-- ---------------------------------------------------------------------------
+-- Guaranteed shutdown.
+--
+-- This library holds analog redstone outputs that drive real thrust through
+-- Create Redstone Links, so "the program stopped" and "the ship stopped" are
+-- two different events. Ctrl+T arrives as error("Terminated", 0) out of
+-- whichever pull happened to be blocking - and terminate bypasses event
+-- filters, so that can be any sleep or receive anywhere in the call tree. Left
+-- unhandled it unwinds straight past every cleanup path, leaving the throttle
+-- high, a stepped tail still deflected, and nobody steering.
+--
+-- So catch it deliberately, here, at the one place that owns the outputs:
+-- nav.allStop() always runs (which recentres a stepped tail), and then the
+-- original error is RE-RAISED. That last part is what keeps the program
+-- killable - a blanket pcall that swallowed "Terminated" would make Ctrl+T do
+-- nothing, which is a worse failure than the one being fixed. Genuine bugs
+-- likewise still reach the player: re-raising at level 0 keeps the message
+-- exactly as it was thrown, rather than stapling this file's line number over
+-- the crash site's. (pcall cannot preserve a traceback; if you are chasing one,
+-- call the *Leg/*Run/*Loop function under xpcall yourself.)
+--
+-- Wrap anything that blocks while holding the controls: nav.serveRemote,
+-- nav.calibrate and nav.flyTo all go through this.
+function nav.withSafeShutdown(body, ...)
+  local results = table.pack(pcall(body, ...))
+
+  -- Looked up through `nav` on purpose, so the self-test can substitute a
+  -- counter and prove this path really does cut the controls.
+  local stopped, stopErr = pcall(nav.allStop)
+  if not stopped then
+    -- The only thing in allStop that can fail is the stepped-tail recentre, and
+    -- the likely cause is a second terminate landing inside its sleeps. Thrust
+    -- is already down; try once more to unwind the tail so the ship is not left
+    -- turning, but do not loop on it - a held Ctrl+T must still get through.
+    pcall(nav.allStop)
+  end
+  state.mission = nil
+
+  if not results[1] then error(results[2], 0) end
+  if not stopped then error(stopErr, 0) end
+  return table.unpack(results, 2, results.n)
 end
 
 -- ===========================================================================
@@ -671,7 +777,11 @@ end
 -- rate are re-derived from how far the ship actually moved since the last
 -- fix and blended with the running estimate.
 local function fuseFix(e, fix, now, alpha)
-  if e.pos and e.lastFixTime then
+  -- fixPos is only ever written alongside pos and lastFixTime, so all three
+  -- travel together - but require it explicitly rather than dereferencing it on
+  -- faith, because an estimate assembled by hand (a test, a restored snapshot)
+  -- would otherwise crash here instead of just starting cold.
+  if e.pos and e.lastFixTime and e.fixPos then
     local dt = now - e.lastFixTime
     if dt > 1e-6 then
       local mvx = (fix.x - e.fixPos.x) / dt
@@ -714,21 +824,25 @@ end
 -- Refines the flight model from what the ship is actually doing, but only
 -- when the current command has been held long enough for the reading to
 -- reflect it rather than the previous command's momentum.
+-- Hoisted out of learnFromObservation rather than closed over its arguments:
+-- learning runs on every accepted fix, and a fresh closure per call was pure
+-- per-tick garbage.
+local function blendToward(model, key, observed, alpha)
+  if observed and observed > 0 then
+    model[key] = model[key] + alpha * (observed - model[key])
+  end
+end
+
 local function learnFromObservation(model, e, command, heldFor, alpha)
   if heldFor < 2 then return model end
-  local function blend(key, observed)
-    if observed and observed > 0 then
-      model[key] = model[key] + alpha * (observed - model[key])
-    end
-  end
   if command.throttle >= 0.95 and e.speed > 0 then
-    blend("maxSpeed", e.speed)
+    blendToward(model, "maxSpeed", e.speed, alpha)
   end
   if math.abs(command.yaw) >= 0.95 and e.headingKnown then
-    blend("yawRate", math.abs(e.yawRate))
+    blendToward(model, "yawRate", math.abs(e.yawRate), alpha)
   end
   if math.abs(command.lift) >= 0.95 then
-    blend("liftSpeed", math.abs(e.vel.y))
+    blendToward(model, "liftSpeed", math.abs(e.vel.y), alpha)
   end
   return model
 end
@@ -757,9 +871,23 @@ function nav.resetEstimate()
   state.estimate = freshEstimate()
 end
 
--- Attempts one sGps fix and folds it in. Returns true if a fix landed.
+-- Attempts one sGps fix and folds it in. Returns true if a fix landed, or
+-- false, err.
+--
+-- sgps.locate does not always fail politely: no modem open, or fewer trusted
+-- hosts than minFixes, and it RAISES instead of returning nil, err. Unprotected
+-- that error unwound through nav.step, out of the flight loop, and past every
+-- place that cuts the throttle - a configuration mistake became a runaway ship.
+-- A fix that cannot be taken is exactly the condition the autopilot already
+-- handles (the estimate goes stale and flyTo stops the ship deliberately), so
+-- turn the exception into that instead, keeping the real reason in lastError -
+-- which nav.getState and the STATUS reply both expose.
 function nav.fix(opts)
-  local x, y, z, err = sgps.locate(opts)
+  local ok, x, y, z, err = pcall(sgps.locate, opts)
+  if not ok then
+    state.lastError = tostring(x)
+    return false, state.lastError
+  end
   if not x then
     state.lastError = err
     return false, err
@@ -769,21 +897,31 @@ function nav.fix(opts)
   return true
 end
 
+-- The work half of nav.step, without the state snapshot. Most callers (acquire,
+-- calibration, the idle branch of serveRemote) threw that snapshot away, which
+-- cost six tables each time round.
+local function stepEstimator()
+  local e = state.estimate
+  local now = os.clock()
+  predict(e, now)
+
+  if (not e.lastFixTime) or (now - e.lastFixTime) >= nav.FIX_INTERVAL then
+    nav.fix()
+    local heldSince = state.commandHeldSince
+    if heldSince then
+      -- Deliberately re-reads the clock: nav.fix blocks for network round trips
+      -- plus RSA, so `now` is measurably stale by here and would understate how
+      -- long the command has actually been held.
+      learnFromObservation(state.model, e, state.command,
+        os.clock() - heldSince, nav.MODEL_ALPHA)
+    end
+  end
+end
+
 -- One estimator tick: extrapolate to now, take a fresh fix if one is due,
 -- and let the flight model learn from whatever the ship is currently doing.
 function nav.step()
-  local now = os.clock()
-  predict(state.estimate, now)
-
-  local e = state.estimate
-  local due = (not e.lastFixTime) or (now - e.lastFixTime) >= nav.FIX_INTERVAL
-  if due then
-    nav.fix()
-    if state.commandHeldSince then
-      learnFromObservation(state.model, state.estimate, state.command,
-        os.clock() - state.commandHeldSince, nav.MODEL_ALPHA)
-    end
-  end
+  stepEstimator()
   return nav.getState()
 end
 
@@ -799,7 +937,7 @@ end
 function nav.acquire(timeout, nudge)
   local deadline = os.clock() + (timeout or 30)
   while os.clock() < deadline do
-    nav.step()
+    stepEstimator()
     local e = state.estimate
     if e.pos and (e.headingKnown or not nudge) then return true end
     if nudge and e.pos and not e.headingKnown then
@@ -901,9 +1039,12 @@ end
 -- refusal to continue on stale position data. opts.shouldAbort is polled
 -- each iteration; return true from it to break off the flight.
 -- Returns true on arrival, or false, err.
-function nav.flyTo(target, opts)
+local function flyToLeg(target, opts)
   opts = opts or {}
   local deadline = opts.timeout and (os.clock() + opts.timeout) or nil
+  local shouldAbort, onTick = opts.shouldAbort, opts.onTick
+  local tickInterval = opts.tickInterval or 0.25
+  local model = state.model -- setModel mutates in place, so this stays current
   state.mission = {x = target.x, y = target.y, z = target.z}
 
   local function finish(ok, err)
@@ -913,25 +1054,34 @@ function nav.flyTo(target, opts)
   end
 
   while true do
-    if opts.shouldAbort and opts.shouldAbort() then return finish(false, "aborted") end
+    if shouldAbort and shouldAbort() then return finish(false, "aborted") end
     if deadline and os.clock() > deadline then return finish(false, "timeout") end
 
-    nav.step()
+    -- nav.step already builds the snapshot guidance needs; the old code threw
+    -- that one away and built a second identical one.
+    local st = nav.step()
 
-    if nav.isStale() then
+    -- st.fixAge is exactly the measurement nav.isStale() would go back to the
+    -- clock for. Same test, one less clock read and no second traversal.
+    if (not st.fixAge) or st.fixAge > nav.MAX_STALE_TIME then
       -- Flying on dead reckoning alone past this point is guessing with a
       -- ship. Stop and let the caller decide.
       return finish(false, "position_stale")
     end
 
-    local st = nav.getState()
-    local cmd = nav.guidanceCommand(st, target, state.model, opts)
+    local cmd = nav.guidanceCommand(st, target, model, opts)
     if cmd.arrived then return finish(true) end
     nav.setCommand(cmd.throttle, cmd.yaw, cmd.lift)
-    if opts.onTick then opts.onTick(st, cmd) end
+    if onTick then onTick(st, cmd) end
 
-    sleep(opts.tickInterval or 0.25)
+    sleep(tickInterval)
   end
+end
+
+function nav.flyTo(target, opts)
+  -- The sleep at the bottom of the leg is a filtered pull, so Ctrl+T surfaces
+  -- there as an error and would otherwise skip `finish` entirely.
+  return nav.withSafeShutdown(flyToLeg, target, opts)
 end
 
 -- ===========================================================================
@@ -944,7 +1094,7 @@ local function sampleSpeedUnder(command, duration, settleTime)
   local deadline = os.clock() + duration
   local samples, headingSamples = {}, {}
   while os.clock() < deadline do
-    nav.step()
+    stepEstimator()
     if os.clock() >= settleUntil then
       local e = state.estimate
       samples[#samples + 1] = {speed = e.speed, vy = e.vel.y}
@@ -971,7 +1121,7 @@ local function measureDeceleration(throttle, startSpeed, window)
   nav.setCommand(throttle, 0, 0)
   local deadline = started + window
   while os.clock() < deadline do
-    nav.step()
+    stepEstimator()
     if state.estimate.speed <= nav.ARRIVAL_SPEED then
       local elapsed = os.clock() - started
       if elapsed > 0 then return startSpeed / elapsed end
@@ -984,7 +1134,7 @@ end
 
 -- Brings the ship up to full speed and returns the speed it settled at.
 local function runUpToSpeed(legTime, settle)
-  local samples = select(1, sampleSpeedUnder({throttle = 1}, legTime, settle))
+  local samples = sampleSpeedUnder({throttle = 1}, legTime, settle)
   local speeds = {}
   for _, s in ipairs(samples) do speeds[#speeds + 1] = s.speed end
   return mean(speeds)
@@ -994,7 +1144,7 @@ end
 -- rate and climb rate - skipping whatever this ship isn't wired for. THIS
 -- FLIES THE SHIP AT FULL THROTTLE - run it somewhere open and high.
 -- Returns the learned model, or nil, err.
-function nav.calibrate(opts)
+local function calibrationRun(opts)
   opts = opts or {}
   local legTime = opts.legTime or 8
   local settle = opts.settleTime or 3
@@ -1015,13 +1165,13 @@ function nav.calibrate(opts)
   -- Acceleration: from a standstill, how long to reach most of that speed.
   nav.allStop()
   sleep(opts.restTime or 4)
-  nav.step()
+  stepEstimator()
   local accelStart = os.clock()
   nav.setCommand(1, 0, 0)
   local reached = nil
   local accelDeadline = os.clock() + legTime
   while os.clock() < accelDeadline do
-    nav.step()
+    stepEstimator()
     if model.maxSpeed and state.estimate.speed >= 0.6 * model.maxSpeed then
       reached = os.clock() - accelStart
       break
@@ -1072,7 +1222,7 @@ function nav.calibrate(opts)
     nav.allStop()
     sleep(opts.restTime or 4)
     local liftDirection = caps.climb and 1 or -1
-    local liftSamples = select(1, sampleSpeedUnder({lift = liftDirection}, legTime, settle))
+    local liftSamples = sampleSpeedUnder({lift = liftDirection}, legTime, settle)
     local vys = {}
     for _, s in ipairs(liftSamples) do vys[#vys + 1] = math.abs(s.vy) end
     local liftSpeed = mean(vys)
@@ -1082,6 +1232,13 @@ function nav.calibrate(opts)
   nav.allStop()
   nav.setModel(model)
   return nav.getModel()
+end
+
+function nav.calibrate(opts)
+  -- Calibration deliberately holds full throttle through several sleeps, which
+  -- is the worst possible moment for a bare Ctrl+T: it would leave the ship at
+  -- maximum thrust in a turn with the program gone.
+  return nav.withSafeShutdown(calibrationRun, opts)
 end
 
 function nav.saveModel(path)
@@ -1146,16 +1303,18 @@ function nav.interpretCommand(senderId, message, authorized)
   return {ok = false, err = "unknown_command"}, nil
 end
 
--- Blocks forever: listens for operator commands and flies whatever mission
--- is current. Run this as the ship's main program.
-function nav.serveRemote(opts)
+local function serveRemoteLoop(opts)
   opts = opts or {}
   local pending = nil    -- target requested but not yet picked up by the flight loop
   local cancelFlag = false
-  local running = true
+
+  -- (There used to be a `running` flag guarding both loops here, cleared after
+  -- waitForAny returned. It could never do anything: waitForAny only returns
+  -- once one of its functions has finished, and at that point the others are
+  -- already abandoned coroutines that will never be resumed to re-test it.)
 
   local function commandLoop()
-    while running do
+    while true do
       local senderId, message = sip.receive()
       if senderId then
         local reply, action = nav.interpretCommand(senderId, message, state.authorizedOperators)
@@ -1176,7 +1335,7 @@ function nav.serveRemote(opts)
   end
 
   local function flightLoop()
-    while running do
+    while true do
       local target = pending
       if target then
         pending = nil
@@ -1191,15 +1350,29 @@ function nav.serveRemote(opts)
       else
         -- Idle: keep the estimator warm so the next GOTO starts from a
         -- current position and a known heading instead of cold.
-        nav.step()
+        stepEstimator()
         sleep(0.5)
       end
     end
   end
 
-  parallel.waitForAny(sip.listenForHandshakes, commandLoop, flightLoop)
-  running = false
-  nav.allStop()
+  -- Ctrl+T is delivered to whichever of these happens to be blocked on a pull,
+  -- and it bypasses event filters, so without this it would surface as a
+  -- "Terminated" error thrown through the middle of the flight loop. parallel
+  -- resumes its coroutines in order, so watching for terminate first turns it
+  -- into an ordinary return from waitForAny; nav.withSafeShutdown then cuts the
+  -- controls. (That wrapper also covers the error route, in case a future
+  -- reordering loses this race.)
+  local function terminateWatcher() os.pullEventRaw("terminate") end
+
+  parallel.waitForAny(terminateWatcher, sip.listenForHandshakes, commandLoop, flightLoop)
+end
+
+-- Blocks forever: listens for operator commands and flies whatever mission
+-- is current. Run this as the ship's main program. Returns with the controls
+-- cut, whether it ended on Ctrl+T or on an error.
+function nav.serveRemote(opts)
+  return nav.withSafeShutdown(serveRemoteLoop, opts)
 end
 
 -- Operator-side helper: hand a command to a ship and wait for its reply.
@@ -1493,6 +1666,70 @@ function nav.selfTest()
     textutils.serialize({cmd = "GOTO", x = 5, y = 6, z = 7}), authorized)
   check("accepts serialized GOTO over the wire",
     reply7.ok and action7 and action7.target.z == 7)
+
+  -- ---- Shutdown safety -------------------------------------------------
+  -- The outputs drive real thrust, so every way out of a blocking call has to
+  -- reach allStop. Ctrl+T is the one that used to escape: it arrives as
+  -- error("Terminated", 0) from whatever pull was blocking. Drive that path
+  -- here with a stand-in allStop, so the test counts the cleanup instead of
+  -- toggling redstone.
+  local realAllStop = nav.allStop
+  local stops = 0
+  nav.allStop = function() stops = stops + 1 end
+
+  local normalOk, valueA, valueB =
+    pcall(nav.withSafeShutdown, function() return "a", "b" end)
+  check("safe shutdown stops the ship on a normal return, passing results through",
+    normalOk and stops == 1 and valueA == "a" and valueB == "b")
+
+  local termOk, termErr = pcall(nav.withSafeShutdown, function()
+    error("Terminated", 0) -- exactly what os.pullEvent raises on Ctrl+T
+  end)
+  check("terminate cuts the controls", stops == 2)
+  -- Re-raised, not swallowed: a program that ignored Ctrl+T would be unkillable.
+  check("terminate still kills the program", termOk == false and termErr == "Terminated")
+
+  local bugOk, bugErr = pcall(nav.withSafeShutdown, function() error("boom", 0) end)
+  check("an error in flight also cuts the controls, and still reports itself",
+    stops == 3 and bugOk == false and tostring(bugErr):find("boom") ~= nil)
+
+  -- Arguments reach the wrapped body, since serveRemote/calibrate/flyTo pass
+  -- theirs through it.
+  local gotArg
+  pcall(nav.withSafeShutdown, function(a, b) gotArg = a + b end, 40, 2)
+  check("safe shutdown forwards arguments to the wrapped call", gotArg == 42)
+
+  nav.allStop = realAllStop
+
+  -- sgps.locate raises rather than returning nil, err for some failures (no
+  -- modem open, too few trusted hosts). That must degrade into "no fix", which
+  -- the autopilot already knows how to stop for - not an exception unwinding
+  -- the flight loop with the throttle still up.
+  local realLocate, savedLastError = sgps.locate, state.lastError
+  sgps.locate = function() error("sgps: simulated blow-up", 0) end
+  local fixOk, fixErr = nav.fix()
+  check("a locate that raises becomes a failed fix, not an exception",
+    fixOk == false and tostring(fixErr):find("simulated blow%-up") ~= nil)
+  check("and the real reason is kept for telemetry",
+    tostring(state.lastError):find("simulated blow%-up") ~= nil)
+  sgps.locate = realLocate
+  state.lastError = savedLastError
+
+  -- Capability caching must not change what capabilities() reports, and must
+  -- notice a rewiring.
+  local savedMap = state.controlMap
+  local capsA = nav.capabilities()
+  check("capability cache returns a stable answer", nav.capabilities() == capsA)
+  nav.setControlMap(nav.CONTROL_MAP_MINIMAL)
+  local capsB = nav.capabilities()
+  check("capability cache is invalidated by a new control map",
+    capsB ~= capsA and capsB.forward == true and capsB.reverse == false and
+    capsB.vertical == false and capsB.yawMode == "level")
+  nav.setControlMap(savedMap)
+  local capsC = nav.capabilities()
+  check("capabilities follow the wiring back",
+    capsC.reverse == (savedMap.reverse ~= nil) and
+    capsC.vertical == ((savedMap.up ~= nil) or (savedMap.down ~= nil)))
 
   print(allPassed and "SELF TEST PASSED" or "SELF TEST FAILED")
   return allPassed

@@ -61,7 +61,7 @@ local sip, sgps = nav.sip, nav.sgps
 if fs.exists(CONFIG.privateKeyPath) and fs.exists(CONFIG.publicKeyPath) then
   sip.loadIdentity(CONFIG.publicKeyPath, CONFIG.privateKeyPath, CONFIG.passphrase)
 else
-  print("Generating a " .. CONFIG.keyBits .. "-bit keypair; this takes a minute...")
+  print("Generating a " .. CONFIG.keyBits .. "-bit keypair...")
   sip.generateIdentity(CONFIG.keyBits)
   sip.saveIdentity(CONFIG.publicKeyPath, CONFIG.privateKeyPath, CONFIG.passphrase)
 end
@@ -73,12 +73,11 @@ print("Ship fingerprint: " .. sgps.publicKeyFingerprint(sip.getPublicKey()))
 -- sGps needs the raw modem (rednet discards the block-distance it depends on);
 -- sip rides rednet for the command channel. Same modem, both opened.
 
+-- Both autodetect when given nil, and both prefer a wireless modem over a
+-- wired one - which an open-coded "first modem on any side" search here did
+-- not, and sGps is useless on a wired modem (no block distance).
 sgps.open(CONFIG.modemSide)
-sip.open(CONFIG.modemSide or (function()
-  for _, side in ipairs(peripheral.getNames()) do
-    if peripheral.getType(side) == "modem" then return side end
-  end
-end)())
+sip.open(CONFIG.modemSide)
 
 -- ---- GPS hosts ------------------------------------------------------------
 -- Pinned once and reused. Re-pinning every boot would mean trusting whatever

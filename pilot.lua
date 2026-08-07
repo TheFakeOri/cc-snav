@@ -42,16 +42,14 @@ local sip = nav.sip
 if fs.exists(CONFIG.privateKeyPath) and fs.exists(CONFIG.publicKeyPath) then
   sip.loadIdentity(CONFIG.publicKeyPath, CONFIG.privateKeyPath, CONFIG.passphrase)
 else
-  print("Generating a " .. CONFIG.keyBits .. "-bit keypair; this takes a minute...")
+  print("Generating a " .. CONFIG.keyBits .. "-bit keypair...")
   sip.generateIdentity(CONFIG.keyBits)
   sip.saveIdentity(CONFIG.publicKeyPath, CONFIG.privateKeyPath, CONFIG.passphrase)
 end
 
-sip.open(CONFIG.modemSide or (function()
-  for _, side in ipairs(peripheral.getNames()) do
-    if peripheral.getType(side) == "modem" then return side end
-  end
-end)())
+-- sip.open(nil) autodetects, and prefers a wireless modem over a wired one -
+-- which an open-coded "first modem on any side" search here did not.
+sip.open(CONFIG.modemSide)
 
 print("Pilot console. This computer is ID " .. os.getComputerID() ..
   " - it must be authorised on the ship.")

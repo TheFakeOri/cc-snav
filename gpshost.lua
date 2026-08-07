@@ -10,9 +10,8 @@
   Copy this to a host computer as `startup.lua` (along with enc.lua, sip.lua
   and sgps/sGps.lua), fill in CONFIG.position from F3, and reboot.
 
-  On first run it generates an RSA keypair, which takes a while in pure Lua -
-  leave it alone until it prints a fingerprint. That keypair is saved, so
-  later boots start immediately.
+  On first run it generates an RSA keypair, then prints its fingerprint. That
+  keypair is saved, so later boots start immediately.
 ]]
 
 local CONFIG = {
@@ -53,7 +52,7 @@ sgps.useSip(sip) -- one shared identity across both layers
 if fs.exists(CONFIG.privateKeyPath) and fs.exists(CONFIG.publicKeyPath) then
   sip.loadIdentity(CONFIG.publicKeyPath, CONFIG.privateKeyPath, CONFIG.passphrase)
 else
-  print("Generating a " .. CONFIG.keyBits .. "-bit keypair; this takes a minute...")
+  print("Generating a " .. CONFIG.keyBits .. "-bit keypair...")
   sip.generateIdentity(CONFIG.keyBits)
   sip.saveIdentity(CONFIG.publicKeyPath, CONFIG.privateKeyPath, CONFIG.passphrase)
   print("Keypair saved.")

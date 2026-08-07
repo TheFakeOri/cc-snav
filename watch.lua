@@ -9,9 +9,8 @@
     watch
 
   It reuses whatever this computer already has - existing keys rather than
-  spending a minute generating new ones, and already-pinned hosts rather than
-  re-pinning. On a computer set up by install.lua it needs no configuration at
-  all.
+  generating new ones, and already-pinned hosts rather than re-pinning. On a
+  computer set up by install.lua it needs no configuration at all.
 
   Ctrl+T to stop.
 
@@ -50,9 +49,9 @@ local sgps = dofile("/sgps/sGps.lua")
 sgps.useSip(sip)
 
 -- ---- identity -------------------------------------------------------------
--- Reuse an existing keypair if this computer has one. Generating a fresh
--- 256-bit key costs about a minute of pure-Lua RSA, and there's no reason to
--- pay that just to read coordinates.
+-- Reuse an existing keypair if this computer has one. Not for speed - keygen
+-- is cheap now - but for identity continuity: a computer that invents a new
+-- key every run looks like a different peer to everything that pinned it.
 
 local IDENTITIES = {
   {"/ship_public.key",  "/ship_private.key"},
@@ -74,7 +73,7 @@ for _, pair in ipairs(IDENTITIES) do
 end
 
 if not loaded then
-  print("Generating a " .. CONFIG.keyBits .. "-bit keypair; this takes a minute...")
+  print("Generating a " .. CONFIG.keyBits .. "-bit keypair...")
   sip.generateIdentity(CONFIG.keyBits)
   sip.saveIdentity("/watch_public.key", "/watch_private.key", CONFIG.passphrase)
 end
